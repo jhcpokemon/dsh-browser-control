@@ -193,6 +193,16 @@ export interface Config {
 	 * whenever `allowUpload` is true.
 	 */
 	uploadDir?: string
+	/**
+	 * Tab isolation (v1.7.15, on by default). When the calling session has no
+	 * working tab yet, the tab-scoped tools used to fall back to whatever tab the
+	 * human had active — which meant an agent silently navigating, typing into and
+	 * closing the user's own tabs. With this on they open a NEW tab in the `DSH`
+	 * tab group instead and work there; on a browser whose tabGroups API is
+	 * available that group is created and labelled by the extension. Set false to
+	 * restore the old "follow the active tab" behaviour.
+	 */
+	isolateTabs?: boolean
 }
 
 export const Config: z<Config> = z.object({
@@ -206,6 +216,7 @@ export const Config: z<Config> = z.object({
 	allowScript: z.boolean().default(true),
 	allowUpload: z.boolean().default(false),
 	uploadDir: z.string().default(''),
+	isolateTabs: z.boolean().default(true),
 })
 
 interface ResolvedConfig {
@@ -218,6 +229,7 @@ interface ResolvedConfig {
 	allowScript: boolean
 	allowUpload: boolean
 	uploadDir: string
+	isolateTabs: boolean
 }
 
 const SNAPSHOT_REF_SELECTOR_PATTERN = /^e\d+$/
@@ -551,12 +563,31 @@ class BridgeController {
 	 * The calling session's working tab, after the same liveness probe isolateParams
 	 * uses. Tools that compose several commands (browser_drag) need the id *before*
 	 * issuing anything, so they must not fall back to the browser's active tab on
-	 * their own — that would silently bypass session isolation.
+	 * their own — that would silently bypass session isolation. Since v1.7.15 a
+	 * session without a working tab gets a freshly opened, DSH-grouped tab instead.
 	 */
 	async sessionTab(signal: AbortSignal): Promise<number | undefined> {
 		const sessionId = TOOL_SESSION.getStore()
 		if (sessionId === undefined) return undefined
-		return await this.liveRecordedTab(sessionId, signal)
+		return await this.ownTab(sessionId, signal)
+	}
+
+	/**
+	 * The tab this session should work in: its recorded working tab while that tab
+	 * is still open, else a new DSH-grouped tab it adopts (v1.7.15 tab isolation).
+	 * `isolateTabs: false` returns undefined instead, leaving the caller with the
+	 * old "follow the browser's active tab" fallback.
+	 */
+	private async ownTab(sessionId: string, signal: AbortSignal): Promise<number | undefined> {
+		const recorded = await this.liveRecordedTab(sessionId, signal)
+		if (recorded !== undefined) return recorded
+		// 本会话还没有工作标签页：默认**不**落到浏览器那个「当前活动标签页」上——那通常
+		// 就是用户自己手动开着的标签，在它里面导航/打字/关掉都不是用户想要的。改为自开
+		// 一个标签（扩展会把它归进 DSH 分组），并把它记成本会话的工作标签页。
+		// `isolateTabs: false` 恢复旧行为（跟随活动标签页）。
+		if (!this.isolateTabs) return undefined
+		const opened = await this.openOwnTab(sessionId, signal)
+		return opened.tabId
 	}
 
 	/** Recorded working tab if it is still open; a gone tab is forgotten here. */
@@ -579,9 +610,41 @@ class BridgeController {
 
 	private async isolateParams(command: string, params: Record<string, unknown>, sessionId: string, signal: AbortSignal): Promise<Record<string, unknown>> {
 		if (typeof params.tabId === 'number' || NO_TAB_DEFAULT_COMMANDS.has(command)) return params
-		const recorded = await this.liveRecordedTab(sessionId, signal)
-		if (recorded === undefined) return params
-		return { ...params, tabId: recorded }
+		const tabId = await this.ownTab(sessionId, signal)
+		return tabId === undefined ? params : { ...params, tabId }
+	}
+
+	/** 是否启用「没有工作标签页就自开一个归组标签」的隔离（v1.7.15，默认开）。 */
+	get isolateTabs(): boolean {
+		return this.current?.isolateTabs !== false
+	}
+
+	/**
+	 * 为本会话新开一个标签（扩展按默认 `group: true` 归进 DSH 分组）并记成它的工作
+	 * 标签页。走的是同一条 `execute()` 路径，所以策略闸门、审计账本、桥接未启用的报错
+	 * 与显式调用 `browser_tabs open` 完全一致；失败时抛出，绝不悄悄退回用户的标签。
+	 * @param sessionId - 调用方会话（工作标签页的归属）。
+	 * @param signal - 工具执行的取消信号。
+	 * @param target - 非空时直接在这个 URL 上生标签（省掉 about:blank 一发），否则开空白页。
+	 * @returns 新标签的 id 与扩展那句原始回执。
+	 */
+	private async openOwnTab(
+		sessionId: string,
+		signal: AbortSignal,
+		target?: { url: string; waitUntil: string; timeoutMs?: number },
+	): Promise<{ tabId: number, result: unknown }> {
+		const params: Record<string, unknown> = target === undefined
+			// 后台开：不抢用户焦点，CDP 照样能在非活动标签上工作。
+			? { url: 'about:blank', waitUntil: 'none', active: false }
+			: { ...target, active: false }
+		const timeoutMs = target?.timeoutMs === undefined ? undefined : target.timeoutMs + BRIDGE_MARGIN_MS
+		const result = await this.execute('tabs.open', params, signal, timeoutMs)
+		const tabId = (result as { tabId?: unknown } | null | undefined)?.tabId
+		if (typeof tabId !== 'number') {
+			throw new Error('browser-bridge: 自开标签页失败 —— 扩展没有回报 tabId，因此无法保证后续操作不落到用户自己的标签上；未继续执行')
+		}
+		this.sessions.adopt(sessionId, tabId)
+		return { tabId, result }
 	}
 
 	/** Record the call and adopt the tab it actually touched (params or result). */
@@ -923,6 +986,72 @@ async function saveMhtml(
 	return { file, bytes: buffer.length, tabId: payload.tabId }
 }
 
+// ---------------------------------------------------------------- web search
+
+/** One organic result as the in-page extraction script reports it. */
+interface SearchHit { title: string, url: string, snippet: string }
+
+/**
+ * The extraction script that runs **inside** the Google results page (one CDP
+ * round trip, no bridge chatter). It deliberately keys off structure the SERP has
+ * kept stable for years — an anchor that wraps an `h3` is a result title, the
+ * nearest `[data-hveid]` block is the result body — instead of Google's internal
+ * class names, which are regenerated every few weeks; pinning those would turn
+ * every redesign into a silent zero-result answer.
+ */
+const GOOGLE_EXTRACT_SOURCE = String.raw`(() => {
+	const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+	const stripCrumbs = (text) => {
+		const cut = text.lastIndexOf('\u203a', 200);
+		return cut === -1 ? text : text.slice(cut + 1).trim();
+	};
+	const seen = new Set();
+	const results = [];
+	const anchors = Array.from(document.querySelectorAll('#search a, #rso a, #botstuff a, [data-snc] a'));
+	for (const anchor of anchors) {
+		const heading = anchor.querySelector('h3');
+		if (!heading) continue;
+		let url = anchor.href || '';
+		if (!/^https?:/i.test(url)) continue;
+		try {
+			const parsed = new URL(url);
+			if (/(^|\.)google\.[a-z.]+$/i.test(parsed.hostname)) {
+				if (parsed.pathname !== '/url') continue;
+				const target = parsed.searchParams.get('q') || parsed.searchParams.get('url');
+				if (!target) continue;
+				url = target;
+			}
+			if (/(^|\.)(googleadservices\.com|doubleclick\.net|gstatic\.com)$/i.test(new URL(url).hostname)) continue;
+		} catch { continue; }
+		if (seen.has(url)) continue;
+		const title = clean(heading.innerText || heading.textContent);
+		if (!title) continue;
+		const block = heading.closest('[data-hveid]') || heading.closest('div.g') || anchor.parentElement;
+		let snippet = '';
+		if (block) {
+			snippet = clean(block.innerText || block.textContent);
+			if (snippet.indexOf(title) === 0) snippet = snippet.slice(title.length).trim();
+			snippet = stripCrumbs(snippet);
+		}
+		seen.add(url);
+		results.push({ title, url, snippet: snippet.slice(0, 400) });
+		if (results.length >= 30) break;
+	}
+	const body = document.body ? String(document.body.innerText || '') : '';
+	const blocked = results.length === 0 && /unusual traffic|detected unusual|automated queries|captcha|\u4e0d\u662f\u673a\u5668\u4eba|\u5f02\u5e38\u6d41\u91cf/i.test(body);
+	const consent = results.length === 0 && !!document.querySelector('form[action*="consent"], #consent-bump, [aria-label*="consent" i]');
+	const noResults = results.length === 0 && /did not match any documents|No results found|\u627e\u4e0d\u5230\u548c\u60a8\u67e5\u8be2\u7684\u76f8\u7b26|\u6ca1\u6709\u627e\u5230\u4e0e/i.test(body);
+	return { url: location.href, title: document.title, blocked, consent, noResults, results };
+})()`
+
+/** Model-facing budget for one search listing (10 results with snippets fits). */
+const SEARCH_RENDER_MAX_CHARS = 9_000
+
+/** Google's results URL; `num` asks for that many organic results per page. */
+function googleSearchUrl(query: string, num: number): string {
+	return `https://www.google.com/search?q=${encodeURIComponent(query)}&num=${num}`
+}
+
 /** Register every `browser_*` tool; each is a thin adapter over one extension command. */
 function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 	// 提示词段落是锦上添花，注册失败（例如别的插件已经占了同一个全局名字）
@@ -933,7 +1062,9 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 			name: 'tool:browser-control',
 			order: 112,
 			text: 'The browser_* tools drive the user\'s real, logged-in browser through the DSH '
-				+ 'Browser Control extension; they act on the active tab unless a tabId is passed. '
+				+ 'Browser Control extension; they act on the calling session\'s own tab, and when it '
+				+ 'has none yet they open a new tab in the DSH tab group instead of taking over a tab '
+				+ 'the user opened by hand (pass an explicit tabId only when you really mean that tab). '
 				+ 'Prefer browser_snapshot first on unfamiliar pages: it numbers interactive elements, '
 				+ 'and browser_click/browser_type accept the returned ref instead of guessing CSS selectors. '
 				+ 'browser_read extracts page text in a window (offset/limit) and reports how much text is '
@@ -942,7 +1073,11 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 				+ 'disabled or no browser is connected. When a result is cut to bound token cost it is '
 				+ 'marked "[renderedTruncated omittedChars=N limitChars=L]" — re-issue a narrower query '
 				+ '(smaller limit, a pattern filter, or browser_read\'s offset) instead of assuming the '
-				+ 'page is shorter than it is.',
+				+ 'page is shorter than it is. browser_search is the web-search entry point: it runs a '
+				+ 'Google query in this same browser and returns titles, URLs and snippets. Use it '
+				+ 'whenever an answer depends on facts outside this machine and this conversation '
+				+ '(news, prices, releases, documentation, other people\'s opinions) instead of '
+				+ 'recalling them — then open the promising results with browser_navigate and read them.',
 		})
 	} catch (error) {
 		;(ctx as Context & { logger?: { warn?: (line: string) => void } }).logger?.warn?.(
@@ -952,10 +1087,10 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 
 	ctx.tools.register(defineTool({
 		name: 'browser_navigate',
-		description: 'Navigate a browser tab to a URL and wait for the page load to settle.',
+		description: 'Navigate a browser tab to a URL and wait for the page load to settle. Without tabId it navigates this session\'s own tab; when the session has none yet it opens a new tab in the DSH tab group and navigates there, so the user\'s own tabs are never taken over. Pass tabId only to target a specific tab on purpose.',
 		parameters: {
 			url: { type: 'string', required: true, description: 'Absolute URL to open in the tab.' },
-			tabId: { type: 'number', description: 'Target tab; defaults to the active tab.' },
+			tabId: { type: 'number', description: 'Target tab; defaults to this session\'s working tab, else a new DSH-grouped tab.' },
 			waitUntil: { type: 'string', description: 'When the navigation counts as arrived: "load" (default) waits for the page load event (15s budget), "domcontentloaded" returns once the DOM is parsed (async components may still be mounting — follow with browser_wait if an element is missing), "commit" once the new document\'s address lands, "none" returns immediately with no arrival check at all.' },
 			timeoutMs: { type: 'number', description: `How long to wait for the page load to settle: defaults to the waitUntil tier (load 15000, commit/domcontentloaded 4000), capped at ${NAV_MAX_MS}. An explicit value always wins over the tier.` },
 		},
@@ -1044,10 +1179,136 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 	}))
 
 	ctx.tools.register(defineTool({
+		name: 'browser_search',
+		description: 'Search the web with Google inside the user\'s real, logged-in browser: loads the Google results page in this session\'s tab (opening a new DSH-grouped tab when the session has none) and returns the organic results — title, URL and snippet — as text. Reach for it FIRST whenever an answer depends on facts outside this machine and this conversation (news, prices, releases, documentation, comparisons) instead of answering from memory, then open the promising hits with browser_navigate. It sees exactly what the user would see in Chrome — their Google account, region and language. When Google serves a consent wall or its "unusual traffic" check the call fails and says what to ask the user for; it never fabricates results.',
+		parameters: {
+			query: { type: 'string', required: true, description: 'What to search for, in natural language. Keep it short and specific; Google applies its own query rewriting.' },
+			num: { type: 'number', description: 'How many organic results to return, 1–20; default 10.' },
+			tabId: { type: 'number', description: 'Target tab; defaults to this session\'s working tab, else a new DSH-grouped tab.' },
+		},
+		output: {
+			schema: {
+				type: 'object',
+				additionalProperties: false,
+				properties: {
+					query: { type: 'string', required: true },
+					engine: { type: 'string', required: true },
+					tabId: { type: 'number', required: true },
+					url: { type: 'string', required: true },
+					resultCount: { type: 'number', required: true },
+					noResults: { type: 'boolean' },
+					results: {
+						type: 'array',
+						required: true,
+						items: {
+							type: 'object',
+							additionalProperties: false,
+							properties: {
+								position: { type: 'number', required: true },
+								title: { type: 'string', required: true },
+								url: { type: 'string', required: true },
+								snippet: { type: 'string' },
+							},
+						},
+					},
+				},
+			},
+			render: (_args, value) => {
+				const head = `Google · ${value.query} — ${value.resultCount} result${value.resultCount === 1 ? '' : 's'} (tab ${value.tabId})`
+				if (value.resultCount === 0) {
+					return [{ type: 'text', text: `${head}\nThe results page carried no organic results. Reword the query or add a distinguishing term before searching again.` }]
+				}
+				const lines = value.results.map(hit => `${hit.position}. ${hit.title}\n   ${hit.url}${hit.snippet === undefined ? '' : `\n   ${hit.snippet}`}`)
+				return [{ type: 'text', text: clampRendered(`${head}\n\n${lines.join('\n')}`, SEARCH_RENDER_MAX_CHARS) }]
+			},
+		},
+		isConcurrencySafe: () => false,
+		presentCall: args => ({ card: 'generic', title: `Google: ${String(args.query)}`, kind: 'other' as const }),
+		async execute(args, exec) {
+			const query = String(args.query ?? '').trim()
+			if (query.length === 0) throw new Error('browser_search: query must be a non-empty string')
+			const num = Math.min(20, Math.max(1, Math.trunc(Number(args.num ?? 10)) || 10))
+			const url = googleSearchUrl(query, num)
+			const budgetMs = NAV_TIERS.domcontentloaded ?? 4_000
+			// 目标标签页：显式 tabId > 本会话工作标签页 > 自开一个（扩展归进 DSH 分组）。
+			// 什么都不走「浏览器当前活动标签页」——那可能是用户自己正开着的页面。
+			const ownTab = args.tabId === undefined ? await controller.sessionTab(exec.signal) : undefined
+			const nav = args.tabId === undefined && ownTab === undefined
+				? await controller.execute('tabs.open', { url, waitUntil: 'domcontentloaded', timeoutMs: budgetMs }, exec.signal, budgetMs + BRIDGE_MARGIN_MS)
+				: await controller.execute(
+					'nav',
+					{ url, waitUntil: 'domcontentloaded', timeoutMs: budgetMs, tabId: args.tabId ?? ownTab },
+					exec.signal,
+					budgetMs + BRIDGE_MARGIN_MS,
+				)
+			const tabId = (nav as { tabId?: unknown } | null | undefined)?.tabId
+			if (typeof tabId !== 'number') throw new Error('browser_search: the browser did not report which tab it loaded the results in, so the results cannot be trusted — retry once, then report this as a bridge problem')
+			// 结果页是 JS 渲染的：domcontentloaded 之后 #search 可能还没挂上。最多再等 6 秒，
+			// 等不到也照常抽（空结果比谎报强）。
+			try {
+				await controller.execute(
+					'wait',
+					{ selector: '#search, #rso, #botstuff', tabId, timeoutMs: 6_000 },
+					exec.signal,
+					6_000 + BRIDGE_MARGIN_MS,
+				)
+			} catch { /* 慢页面/改版：交给下面的抽取如实报告 */ }
+			// 抽取脚本本身的预算显式给足：扩展侧 eval 的 params.timeoutMs 缺省只留 100ms，
+			// 结果页脚本稍慢就会被判超时（effectState=unknown，其实页面好好的）。
+			let raw: { value?: unknown }
+			try {
+				raw = await controller.execute('eval', { tabId, expression: GOOGLE_EXTRACT_SOURCE, timeoutMs: 15_000 }, exec.signal, 20_000) as { value?: unknown }
+			} catch (error) {
+				throw new Error(`browser_search: could not read the Google results page in tab ${tabId} (${url}) — ${errorMessage(error)}. The page is still open in that tab, so browser_read can show what is actually there instead of retrying blind.`)
+			}
+			const page = raw.value
+			if (page === null || typeof page !== 'object') {
+				throw new Error(`browser_search: the Google results page did not return a result set (got ${typeof page}) — it may still be loading; retry once, or open ${url} with browser_navigate and read it.`)
+			}
+			const shape = page as { url?: unknown, blocked?: unknown, consent?: unknown, noResults?: unknown, results?: unknown }
+			const hits: SearchHit[] = []
+			if (Array.isArray(shape.results)) {
+				for (const item of shape.results) {
+					if (item === null || typeof item !== 'object') continue
+					const hit = item as { title?: unknown, url?: unknown, snippet?: unknown }
+					if (typeof hit.title !== 'string' || hit.title.length === 0) continue
+					if (typeof hit.url !== 'string' || hit.url.length === 0) continue
+					hits.push({
+						title: toWellFormed(hit.title),
+						url: toWellFormed(hit.url),
+						snippet: typeof hit.snippet === 'string' ? toWellFormed(hit.snippet) : '',
+					})
+					if (hits.length >= num) break
+				}
+			}
+			if (hits.length === 0) {
+				if (shape.blocked === true) {
+					throw new Error(`browser_search: Google answered with its "unusual traffic" / captcha check instead of results (tab ${tabId}, ${url}). The browser needs a human once: ask the user to clear that check in tab ${tabId}, then call browser_search again — retrying automatically only deepens the block.`)
+				}
+				if (shape.consent === true) {
+					throw new Error(`browser_search: Google is showing a consent / cookie wall instead of results (tab ${tabId}, ${url}). Ask the user to accept it once in tab ${tabId}, then call browser_search again.`)
+				}
+				if (shape.noResults === true) {
+					return { query, engine: 'google', tabId, url, resultCount: 0, noResults: true, results: [] as { position: number, title: string, url: string, snippet?: string }[] }
+				}
+				throw new Error(`browser_search: no organic results could be read off the results page in tab ${tabId} (${url}). Google may have changed its markup, or the query has no results — open the page with browser_read to see what is actually there before concluding the web has nothing.`)
+			}
+			return {
+				query,
+				engine: 'google',
+				tabId,
+				url: typeof shape.url === 'string' ? toWellFormed(shape.url) : url,
+				resultCount: hits.length,
+				results: hits.map((hit, index) => ({ position: index + 1, ...hit })),
+			}
+		},
+	}))
+
+	ctx.tools.register(defineTool({
 		name: 'browser_read',
 		description: 'Read the current page: title, URL and the page text itself (or full HTML) in a window you control with offset/limit. The returned text is what you see — no separate fetch step is needed.',
 		parameters: {
-			tabId: { type: 'number', description: 'Target tab; defaults to the active tab.' },
+			tabId: { type: 'number', description: 'Target tab; defaults to this session\'s working tab — a new DSH-grouped tab when the session has none.' },
 			mode: { type: 'string', description: '"text" (default) for visible text, "html" for the whole document.' },
 			offset: { type: 'number', description: `Character index the window starts at; default 0. Use the "call again with offset=" value the previous result reported.` },
 			limit: { type: 'number', description: `Characters to return; default and cap ${READ_WINDOW_MAX_CHARS}.` },
@@ -1105,7 +1366,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 		name: 'browser_snapshot',
 		description: 'Inventory the page\'s interactive elements with stable refs; pass a ref to browser_click/browser_type afterwards. mode:"ax" numbers them by Chrome\'s accessibility tree (role + accessible name), which survives a DOM redesign; the default mode matches CSS selectors.',
 		parameters: {
-			tabId: { type: 'number', description: 'Target tab; defaults to the active tab.' },
+			tabId: { type: 'number', description: 'Target tab; defaults to this session\'s working tab — a new DSH-grouped tab when the session has none.' },
 			offset: { type: 'number', description: 'Skip this many items into the inventory (paging); default 0. Refs are valid for THIS call only — take the next page in the same breath if you need stable refs.' },
 			limit: { type: 'number', description: 'Page size: max items returned by this call; defaults to 120. The extension supplies up to a 200-item window per call.' },
 			mode: { type: 'string', description: '"ax" for the accessibility tree, "dom" (default) for the selector list. "ax" falls back to "dom" with axFallback set if the page gives no a11y tree.' },
@@ -1256,7 +1517,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 			ref: { type: 'string', description: 'Element ref from browser_snapshot (e.g. "e3"); wins over selector.' },
 			selector: { type: 'string', description: 'CSS selector; ignored when ref is given. Same-origin frames: either "iframe#shell >>> textarea" or pair this with frameSelector.' },
 			frameSelector: { type: 'string', description: 'CSS selector of a same-origin iframe to resolve `selector` inside; chain nested frames with ">>>". Ignored when ref is given (refs already know their frame). Cross-origin frames are not supported.' },
-			tabId: { type: 'number', description: 'Target tab; defaults to the active tab.' },
+			tabId: { type: 'number', description: 'Target tab; defaults to this session\'s working tab — a new DSH-grouped tab when the session has none.' },
 			doubleClick: { type: 'boolean', description: 'Send a double click instead.' },
 		},
 		output: {
@@ -1283,7 +1544,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 			ref: { type: 'string', description: 'Element ref from browser_snapshot; wins over selector.' },
 			selector: { type: 'string', description: 'CSS selector; ignored when ref is given. Same-origin frames: either "iframe#shell >>> textarea" or pair this with frameSelector.' },
 			frameSelector: { type: 'string', description: 'CSS selector of a same-origin iframe to resolve `selector` inside; chain nested frames with ">>>". Ignored when ref is given. Cross-origin frames are not supported.' },
-			tabId: { type: 'number', description: 'Target tab; defaults to the active tab.' },
+			tabId: { type: 'number', description: 'Target tab; defaults to this session\'s working tab — a new DSH-grouped tab when the session has none.' },
 			submit: { type: 'boolean', description: 'Press Enter after filling.' },
 			mode: { type: 'string', enum: ['fill', 'type'], description: '"fill" (default) sets the value directly and fires input/change — right for normal forms. "type" focuses the element and sends per-character trusted key events, which terminals (hterm/xterm) and keydown-only editors require; their value may stay empty because the widget consumes keys instead of storing text.' },
 		},
@@ -1313,7 +1574,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 		parameters: {
 			key: { type: 'string', required: true, description: 'Named key, a single character, or "Modifier+Key" (alt, ctrl/control, meta/command, shift). Unknown names now fail loudly instead of doing nothing.' },
 			modifiers: { type: 'array', items: { type: 'string' }, description: 'Alternative to the "Ctrl+A" spelling: ["ctrl", "shift"]. Shift alone still lets the character be typed; ctrl/meta suppress insertion.' },
-			tabId: { type: 'number', description: 'Target tab; defaults to the active tab.' },
+			tabId: { type: 'number', description: 'Target tab; defaults to this session\'s working tab — a new DSH-grouped tab when the session has none.' },
 		},
 		output: {
 			schema: { type: 'object', additionalProperties: true },
@@ -1334,7 +1595,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 		parameters: {
 			x: { type: 'number', description: 'Horizontal delta in pixels; defaults to 0.' },
 			y: { type: 'number', description: 'Vertical delta in pixels; positive scrolls down.' },
-			tabId: { type: 'number', description: 'Target tab; defaults to the active tab.' },
+			tabId: { type: 'number', description: 'Target tab; defaults to this session\'s working tab — a new DSH-grouped tab when the session has none.' },
 		},
 		output: {
 			schema: { type: 'object', additionalProperties: true },
@@ -1359,7 +1620,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 			text: { type: 'string', description: 'Literal substring that must appear in document.body.innerText.' },
 			fn: { type: 'string', description: 'JS predicate evaluated in the page: an expression ("window.x === 3") or a function body ("() => !!document.querySelector(\'.row\')").' },
 			timeoutMs: { type: 'number', description: `Give up after this many milliseconds; defaults to 15000, capped at ${WAIT_MAX_MS}.` },
-			tabId: { type: 'number', description: 'Target tab; defaults to the active tab.' },
+			tabId: { type: 'number', description: 'Target tab; defaults to this session\'s working tab — a new DSH-grouped tab when the session has none.' },
 		},
 		output: {
 			schema: { type: 'object', additionalProperties: true },
@@ -1385,7 +1646,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 			selector: { type: 'string', required: true, description: 'CSS selector to query. Same-origin frames: either "iframe#shell >>> textarea" or pair this with frameSelector.' },
 			frameSelector: { type: 'string', description: 'CSS selector of a same-origin iframe to resolve `selector` inside; chain nested frames with ">>>". Cross-origin frames are not supported.' },
 			limit: { type: 'number', description: 'Maximum items to describe; defaults to 10, capped at 50 (count is always the full total).' },
-			tabId: { type: 'number', description: 'Target tab; defaults to the active tab.' },
+			tabId: { type: 'number', description: 'Target tab; defaults to this session\'s working tab — a new DSH-grouped tab when the session has none.' },
 		},
 		output: {
 			schema: { type: 'object', additionalProperties: true },
@@ -1407,7 +1668,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 		parameters: {
 			action: { type: 'string', enum: ['on', 'off', 'status'], required: true, description: '"on" shows the overlay, "off" removes it (and clears the abort state), "status" reports what is actually on the page.' },
 			note: { type: 'string', description: 'on: body text — say what you are doing (e.g. "正在把「局域网」档改成放行"). The title cannot be set.' },
-			tabId: { type: 'number', description: 'Target tab; defaults to the active tab.' },
+			tabId: { type: 'number', description: 'Target tab; defaults to this session\'s working tab — a new DSH-grouped tab when the session has none.' },
 		},
 		output: {
 			schema: { type: 'object', additionalProperties: true },
@@ -1438,7 +1699,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 			httpOnly: { type: 'boolean', description: 'set: hide the cookie from page scripts.' },
 			sameSite: { type: 'string', description: 'set: Strict | Lax | None.' },
 			expires: { type: 'number', description: 'set: Unix seconds; omit for a session cookie.' },
-			tabId: { type: 'number', description: 'Target tab; defaults to the active tab.' },
+			tabId: { type: 'number', description: 'Target tab; defaults to this session\'s working tab — a new DSH-grouped tab when the session has none.' },
 		},
 		output: {
 			schema: { type: 'object', additionalProperties: true },
@@ -1509,7 +1770,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 		parameters: {
 			action: { type: 'string', required: true, description: 'One of: list, open, close, activate, group, ungroup, back, forward.' },
 			url: { type: 'string', description: 'URL for the open action.' },
-			tabId: { type: 'number', description: 'Target tab for close/activate/group/back/forward; defaults to the active tab for back/forward.' },
+			tabId: { type: 'number', description: 'Target tab for close/activate/group/back/forward; defaults to this session\'s working tab (a new DSH-grouped tab when the session has none), and for back/forward only when it has one.' },
 			tabIds: { type: 'array', items: { type: 'number' }, description: 'For close: every tab to close in one call. The result reports each id (closed / alreadyGone / failed) instead of stopping at the first failure.' },
 			active: { type: 'boolean', description: 'Whether a newly opened tab becomes active; defaults to true.' },
 			group: { type: 'boolean', description: 'For open: put the new tab in the DSH tab group. Defaults to true; pass false to keep it loose.' },
@@ -1674,7 +1935,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 		description: 'Run JavaScript in the page and get the JSON result back as a string. Prefer read-only inspection.',
 		parameters: {
 			expression: { type: 'string', required: true, description: 'JavaScript expression or statement sequence; awaited like a promise body.' },
-			tabId: { type: 'number', description: 'Target tab; defaults to the active tab.' },
+			tabId: { type: 'number', description: 'Target tab; defaults to this session\'s working tab — a new DSH-grouped tab when the session has none.' },
 			timeoutMs: { type: 'number', description: `Give up after this many milliseconds; defaults to 60000, capped at ${EVAL_MAX_MS}.` },
 		},
 		output: {
@@ -1721,7 +1982,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 		name: 'browser_screenshot',
 		description: 'Capture the tab as PNG/JPEG, save it under the configured shots directory, and return the absolute file path plus the image\'s real pixel size. fullPage captures the whole scrollable page in one shot (sticky/fixed headers may repeat); selector captures one element.',
 		parameters: {
-			tabId: { type: 'number', description: 'Target tab; defaults to the active tab.' },
+			tabId: { type: 'number', description: 'Target tab; defaults to this session\'s working tab — a new DSH-grouped tab when the session has none.' },
 			fullPage: { type: 'boolean', description: 'Capture the entire scrollable page instead of just the viewport. The receipt\'s width/height show the real size.' },
 			selector: { type: 'string', description: 'CSS selector: capture just that element (scrolled into view); the receipt carries its rect.' },
 			format: { type: 'string', description: '"png" (default) or "jpeg".' },
@@ -1798,7 +2059,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 		name: 'browser_console_log',
 		description: 'Read the captured `console.log/info/warn/error` entries for a tab, with the entry text itself. Set `clear:true` to also empty the buffer so the next call shows only entries recorded after this one. Useful for "what did the page log after I clicked submit".',
 		parameters: {
-			tabId: { type: 'number', description: 'Target tab; defaults to the active tab.' },
+			tabId: { type: 'number', description: 'Target tab; defaults to this session\'s working tab — a new DSH-grouped tab when the session has none.' },
 			levels: { type: 'array', items: { type: 'string' }, description: 'Filter to one or more of: log, info, warn, error, debug.' },
 			pattern: { type: 'string', description: 'Regex (case-insensitive) matched against the formatted text.' },
 			limit: { type: 'number', description: 'Maximum entries to return; default 100, capped at 500.' },
@@ -1868,7 +2129,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 		name: 'browser_network_log',
 		description: 'Read captured HTTP request/response pairs for a tab. `includeStatic:true` adds images / fonts / stylesheets / scripts (filtered by default — they dominate the buffer). `methodPattern` / `urlPattern` / `status` filter server-side results; `clear:true` empties the buffer.',
 		parameters: {
-			tabId: { type: 'number', description: 'Target tab; defaults to the active tab.' },
+			tabId: { type: 'number', description: 'Target tab; defaults to this session\'s working tab — a new DSH-grouped tab when the session has none.' },
 			includeStatic: { type: 'boolean', description: 'Include images / fonts / stylesheets / scripts. Default false.' },
 			methodPattern: { type: 'string', description: 'Regex (case-insensitive) matched against the HTTP method.' },
 			urlPattern: { type: 'string', description: 'Regex (case-insensitive) matched against the URL.' },
@@ -1951,7 +2212,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 		name: 'browser_network_clear',
 		description: 'Empty the per-tab network capture buffer without returning the rows.',
 		parameters: {
-			tabId: { type: 'number', description: 'Target tab; defaults to the active tab.' },
+			tabId: { type: 'number', description: 'Target tab; defaults to this session\'s working tab — a new DSH-grouped tab when the session has none.' },
 		},
 		output: {
 			schema: {
@@ -1976,7 +2237,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 		name: 'browser_pdf',
 		description: 'Export the current page to a PDF. `path` may be absolute (saved there) or omitted (saved under the configured shotsDir). Returns the absolute path + size; the PDF preserves text (selectable, searchable) and print-media CSS.',
 		parameters: {
-			tabId: { type: 'number', description: 'Target tab; defaults to the active tab.' },
+			tabId: { type: 'number', description: 'Target tab; defaults to this session\'s working tab — a new DSH-grouped tab when the session has none.' },
 			path: { type: 'string', description: 'Absolute path. Omit to save under the configured shotsDir with a timestamped name.' },
 			landscape: { type: 'boolean', description: 'Use landscape orientation.' },
 			printBackground: { type: 'boolean', description: 'Render CSS backgrounds. Default true.' },
@@ -2019,7 +2280,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 		name: 'browser_archive',
 		description: 'Save the whole page as a single-file MHTML archive (text, images and styles inline; no network needed to reopen it). Returns the absolute path. The archive is a snapshot of when it was taken — scripts inside do not run and later page changes are not reflected; read it back with file tools or grep it like text.',
 		parameters: {
-			tabId: { type: 'number', description: 'Target tab; defaults to the active tab.' },
+			tabId: { type: 'number', description: 'Target tab; defaults to this session\'s working tab — a new DSH-grouped tab when the session has none.' },
 			path: { type: 'string', description: 'Absolute path. Omit to save under the configured shotsDir with a timestamped .mhtml name.' },
 		},
 		output: {
@@ -2051,7 +2312,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 		name: 'browser_emulate',
 		description: 'Switch the tab into a device viewport (mobile / tablet / desktop) for responsive-UI testing, and throttle the network or CPU to test slow conditions. `device:"reset"` restores the user\'s actual viewport and clears all throttling. `network` presets (this tool\'s own numbers): slow3g = 400ms RTT + ~50KB/s both ways, fast3g = 150ms + ~200KB/s down / ~94KB/s up, offline, reset to clear. `cpuThrottlingRate` multiplies CPU cost (1 = off, up to 20). Throttling lives in the debugger session — it is gone when the extension detaches, and device:"reset" clears it too. Custom `width`/`height`/`deviceScaleFactor`/`isMobile`/`hasTouch` override any preset field.',
 		parameters: {
-			tabId: { type: 'number', description: 'Target tab; defaults to the active tab.' },
+			tabId: { type: 'number', description: 'Target tab; defaults to this session\'s working tab — a new DSH-grouped tab when the session has none.' },
 			device: { type: 'string', description: 'Preset: desktop | mobile-iphone-13 | mobile-pixel-7 | tablet-ipad | reset. Or pass custom width/height below.' },
 			network: { type: 'string', description: 'slow3g | fast3g | offline | reset. The receipt reports the applied latency/throughput in bytes per second.' },
 			cpuThrottlingRate: { type: 'number', description: 'CPU slowdown multiplier: 1 = none (default), 4 = mid-range phone, up to 20.' },
@@ -2149,7 +2410,7 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 		name: 'browser_metrics',
 		description: 'Read the tab\'s performance counters (Performance.getMetrics): DOM node count, JS heap usage, layout/style recalc counts, script/task durations. Use it to back "this page is heavy" with numbers, before and after an action. Read-only.',
 		parameters: {
-			tabId: { type: 'number', description: 'Target tab; defaults to the active tab.' },
+			tabId: { type: 'number', description: 'Target tab; defaults to this session\'s working tab — a new DSH-grouped tab when the session has none.' },
 		},
 		output: {
 			schema: {
@@ -2509,7 +2770,7 @@ function registerDragTool(ctx: Context, controller: BridgeController): void {
 		fromY: { type: 'number', description: 'Viewport y of the drag start point (with fromX).' },
 		toX: { type: 'number', description: 'Viewport x of the drop point (with toY).' },
 		toY: { type: 'number', description: 'Viewport y of the drop point (with toX).' },
-		tabId: { type: 'number', description: 'Target tab; defaults to the active tab.' },
+		tabId: { type: 'number', description: 'Target tab; defaults to this session\'s working tab — a new DSH-grouped tab when the session has none.' },
 		mode: { type: 'string', description: '"auto" (default), "mouse" or "html5" — see the tool description.' },
 		steps: { type: 'number', description: 'Intermediate mouse moves in mouse mode, 1–50 (default 12).' },
 	},

@@ -1,10 +1,11 @@
-# 工具清单（30 个）
+# 工具清单（31 个）
 
 按用途分组的完整表；入参与回执的边界见 [BEHAVIOR.md](BEHAVIOR.md)。
 
 | 工具 | 功能 |
 |---|---|
 | `browser_navigate` | 导航到 URL |
+| `browser_search` | 用**你的真实 Chrome** 跑一次 Google：在（本会话自己的）标签页里打开结果页，把自然结果的标题 / URL / 摘要按条返回（`query` 必填，`num` 1–20 默认 10，可显式给 `tabId`）。继承你的 Google 登录态、地区与语言；遇到 Google 的「异常流量」验证或同意墙会直接报错并说明该请用户做什么，绝不编造结果。抽取值只认锚点套 `h3` + `[data-hveid]` 这类稳定结构，不认 Google 每周重排的 class 名（v1.7.15+） |
 | `browser_read` | 读取页面文本/HTML，正文直接给模型（`offset`/`limit` 窗口，长文分页） |
 | `browser_snapshot` | 页面快照 → 逐条列出 ref 的交互树（`mode:"ax"` 走 Chrome 无障碍树，拿 role + 可访问名）；v1.7.7 起支持 `offset` **分页**：页头写明「第几到第几 / 页面总数 / 下一页 offset」，超出扩展 200 条窗口的部分如实说明用 find/read 补齐；扩展 1.7.5 起自动走进**同源 iframe**，帧内元素标 `(in iframe#shell)`，跨源帧数如实写 `crossOriginFrames` |
 | `browser_click` | 点击元素（by ref / selector）；同源 iframe 用 `frameSelector` 或 `"iframe#shell >>> button"` |

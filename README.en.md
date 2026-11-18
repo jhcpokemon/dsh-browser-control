@@ -25,7 +25,7 @@ A dsh plugin plus a Chrome extension. The extension dials back to dsh over loopb
 
 No headless browser, no copying login state around, no MCP — it drives the signed-in Chrome on your screen.
 
-- 30 `browser_*` tools, usable from natural language
+- 31 `browser_*` tools, usable from natural language
 - Visible: tabs the agent opens join a `DSH` group; one-click lock in the extension popup
 - Local gates: read-only / no arbitrary JS / upload allowlist
 - Auditable: in-memory audit trail plus a cross-restart journal
@@ -77,11 +77,23 @@ config:
 
 Blocked commands are **never sent to the browser** (zero side effects) and fail with `blocked_by_policy`. `browser_upload` is the only tool that can hand local files to a page: off by default, limited to files inside `uploadDir` (symlinks are resolved first). Field reference and host-version differences: [dsh-config/README.md](dsh-config/README.md).
 
-## Tools (30)
+## Tab isolation and web search (v1.7.15)
+
+```yaml
+config:
+  isolateTabs: true       # on by default: no working tab ⇒ open a new DSH-grouped tab instead of using yours
+```
+
+A call that omits `tabId` only lands on the session's **own** tab. When the session has none yet, the plugin opens a new tab (`tabs.open`, filed into the `DSH` group by the extension) and works there; before v1.7.15 it fell back to the browser's active tab — usually the page you happened to have open. A failed self-open throws instead of quietly falling back to your tab; pass `tabId` to work on a specific page. `isolateTabs: false` restores the old behaviour.
+
+`browser_search` runs Google in **your own Chrome**: it loads the results page and hands back each organic result's title / URL / snippet (inheriting your login, region and language — including Google's consent and "unusual traffic" checks, which fail with what to ask the user for instead of pretending to have results). Details: [behavior contract](docs/BEHAVIOR.md).
+
+## Tools (31)
 
 Grouped by purpose; inputs, receipts and edge cases are in the [full tool reference](docs/TOOLS.en.md).
 
 - Page: `browser_navigate` `browser_read` `browser_snapshot` `browser_find` `browser_click` `browser_type` `browser_press` `browser_scroll` `browser_wait` `browser_evaluate` `browser_drag` `browser_upload`
+- Search: `browser_search`
 - Tabs & windows: `browser_tabs` `browser_windows` `browser_sessions`
 - Browser state: `browser_cookies` `browser_dialog` `browser_hold` `browser_emulate` `browser_metrics` `browser_console_log` `browser_network_log` `browser_network_clear`
 - Files: `browser_screenshot` `browser_pdf` `browser_archive` `browser_cleanup`
@@ -93,7 +105,7 @@ Grouped by purpose; inputs, receipts and edge cases are in the [full tool refere
 
 | Document | Contents |
 |---|---|
-| [Tools](docs/TOOLS.en.md) | Inputs, receipts and edge cases for all 30 tools |
+| [Tools](docs/TOOLS.en.md) | Inputs, receipts and edge cases for all 31 tools |
 | [Behavior](docs/BEHAVIOR.md) | Navigation arrival, snapshot, lock, overlay, drag, upload |
 | [Install troubleshooting](docs/INSTALL.md) | Mirror lag, 24-hour gate, offline asset, local checkout |
 | [Security](SECURITY.md) | Token, permissions, threat boundaries |

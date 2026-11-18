@@ -76,6 +76,16 @@ export interface Config {
      * whenever `allowUpload` is true.
      */
     uploadDir?: string;
+    /**
+     * Tab isolation (v1.7.15, on by default). When the calling session has no
+     * working tab yet, the tab-scoped tools used to fall back to whatever tab the
+     * human had active — which meant an agent silently navigating, typing into and
+     * closing the user's own tabs. With this on they open a NEW tab in the `DSH`
+     * tab group instead and work there; on a browser whose tabGroups API is
+     * available that group is created and labelled by the extension. Set false to
+     * restore the old "follow the active tab" behaviour.
+     */
+    isolateTabs?: boolean;
 }
 export declare const Config: z<Config>;
 /** Cordis plugin entry: wire the settings-driven lifecycle plus the model-facing tools. */

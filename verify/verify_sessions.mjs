@@ -1,10 +1,12 @@
-// 多 session 隔离的台子（v1.7.6，纯插件特性）。三面：
+// 多 session 隔离的台子（v1.7.6，纯插件特性）。四面：
 //   1) 隔离核心：两个 agent 各自用自己的工作标签页——省略 tabId 的调用落到
 //      **本会话**记下的那个（先向扩展核验它还开着），而不是浏览器活动页；
-//   2) 回退与收养：工作标签页被关掉 → 退回活动页并改记新的；tabs.open 一类
-//      带结果的命令把新标签页收养成会话的工作页；
-//   3) 兼容与契约：没有 agent 身份的调用完全维持旧行为（不注入）；browser_sessions
-//      list/release 可用、只读档可查、render 标出「你」。
+//   2) 收养与回退（v1.7.15）：工作标签页被关掉 → **自开一个标签**（`tabs.open`，
+//      扩展归进 DSH 分组）并收养成新的工作页，不再落到用户手动开着的活动页；
+//      `tabs.open` 一类带结果的命令同样把新标签页收养成会话的工作页；
+//   3) 兼容与契约：没有 agent 身份的调用完全维持旧行为（不注入）；`isolateTabs:false`
+//      恢复「跟随活动标签页」；browser_sessions list/release 可用、只读档可查、render 标出「你」；
+//   4) 只读档可查会话清单。
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -78,7 +80,7 @@ const run = (name, args, agentId) => tool(name).execute(args, {
 }).then((r) => ({ ok: true, value: r }), (e) => ({ ok: false, error: String(e?.message ?? e) }));
 const last = () => received[received.length - 1];
 
-check("browser_sessions 已注册（工具面 30 条）", Boolean(tool("browser_sessions")) && tools.length === 30, String(tools.length));
+check("browser_sessions 已注册（工具面 31 条）", Boolean(tool("browser_sessions")) && tools.length === 31, String(tools.length));
 
 /* ============ 1. 隔离核心 ============ */
 await run("browser_navigate", { url: "https://a.test/", tabId: 100 }, "agent-a");
@@ -94,17 +96,26 @@ check("B 省略 tabId ⇒ 落到 B 自己的 200", last().params.tabId === 200, 
 await run("browser_click", { selector: "#nobody" });
 check("没有 agent 身份的调用：不注入（旧行为原样）", last().command === "click" && last().params.tabId === undefined, JSON.stringify(last()));
 
-/* ============ 2. 收养与回退 ============ */
+/* ============ 2. 收养与回退（v1.7.15：回退改成自开标签） ============ */
 await run("browser_tabs", { action: "open", url: "https://new.test/" }, "agent-a");
 check("tabs.open 走 tabs.open 命令（不注入、不误当工作页）", last().command === "tabs.open" && last().params.tabId === undefined, JSON.stringify(last()));
 await run("browser_click", { selector: "#after-open" }, "agent-a");
 check("tabs.open 结果里的新标签被收养成 A 的工作页（300）", last().params.tabId === 300, JSON.stringify(last()));
 
 liveTabs.delete(300);
-await run("browser_click", { selector: "#after-close" }, "agent-a");
-check("工作标签 300 被关掉 ⇒ 退回活动页（不注入，命令里没有 tabId）", last().params.tabId === undefined, JSON.stringify(last()));
+{
+  const before = received.length;
+  await run("browser_click", { selector: "#after-close" }, "agent-a");
+  const batch = received.slice(before);
+  const opened = batch.find((entry) => entry.command === "tabs.open");
+  const click = batch.find((entry) => entry.command === "click");
+  // v1.7.15：工作页没了不再退到用户的活动页，而是先自开一个标签（扩展把它归进 DSH 分组）。
+  check("工作标签 300 被关掉 ⇒ 先自开一个标签（tabs.open + group 默认值），不落到用户活动页",
+    opened !== undefined && opened.params.group !== false && click !== undefined && click.params.tabId === 300,
+    JSON.stringify(batch));
+}
 await run("browser_click", { selector: "#after-close-2" }, "agent-a");
-check("回退后拿到活动页结果 ⇒ 改记 200 为 A 的新工作页", last().params.tabId === 200, JSON.stringify(last()));
+check("自开的新标签被记成 A 的新工作页（300）", last().command === "click" && last().params.tabId === 300, JSON.stringify(last()));
 
 /* tabs.list 不参与注入 */
 await run("browser_tabs", { action: "list" }, "agent-a");
@@ -115,23 +126,76 @@ const listing = await run("browser_sessions", {}, "agent-a");
 check("list：当前会话是 agent-a", listing.value.current === "agent-a", JSON.stringify(listing.value));
 check("list：两个会话都在，工作标签页各自对得上",
   listing.value.sessions.length === 2
-  && listing.value.sessions.some((s) => s.sessionId === "agent-a" && s.workingTabId === 200)
+  && listing.value.sessions.some((s) => s.sessionId === "agent-a" && s.workingTabId === 300)
   && listing.value.sessions.some((s) => s.sessionId === "agent-b" && s.workingTabId === 200),
   JSON.stringify(listing.value.sessions));
 check("list：调用计数与时间戳是数字", listing.value.sessions.every((s) => typeof s.calls === "number" && s.calls > 0 && typeof s.lastActiveAt === "number"));
 
 const rendered = tool("browser_sessions").output.render({}, listing.value)[0].text;
-check("render：标出「你」与工作标签", /you: agent-a/.test(rendered) && /\* agent-a — tab 200/.test(rendered), rendered);
+check("render：标出「你」与工作标签", /you: agent-a/.test(rendered) && /\* agent-a — tab 300/.test(rendered), rendered);
 
 const released = await run("browser_sessions", { action: "release" }, "agent-b");
 check("release：B 拿回自己释放的 200", released.value.releasedTabId === 200, JSON.stringify(released.value));
-await run("browser_click", { selector: "#b-after-release" }, "agent-b");
-check("释放后 B 省略 tabId ⇒ 不再注入（回到活动页行为）", last().params.tabId === undefined, JSON.stringify(last()));
+{
+  const before = received.length;
+  await run("browser_click", { selector: "#b-after-release" }, "agent-b");
+  const batch = received.slice(before);
+  // 释放之后没有工作标签页了：v1.7.15 起自开一个，而不是回到活动页（活动的还是 200）。
+  check("释放后 B 省略 tabId ⇒ 自开标签并落在新标签上（不再复用活动页）",
+    batch.some((entry) => entry.command === "tabs.open") && batch.at(-1)?.command === "click" && batch.at(-1)?.params.tabId === 300,
+    JSON.stringify(batch));
+}
 
 const badAction = await run("browser_sessions", { action: "steal" }, "agent-a");
 check("非法 action 报出合法清单", badAction.ok === false && /list.*release|release.*list/.test(badAction.error), badAction.error);
 
-/* ============ 4. 只读档 ============ */
+/* ============ 4. isolateTabs:false 恢复旧行为 ============ */
+{
+  const offTools = [];
+  const offDisposers = [];
+  const offCfg = Config({ stateDir: STATE, enabled: true, port: 9809, token: "sessions-off", shotsDir: path.join(STATE, "shots"), isolateTabs: false });
+  const offSettings = { register(_ns, schema, options) { const v = schema(options?.base ?? offCfg); return { get: () => v, watch: () => {}, set: () => {} }; } };
+  const c = {
+    logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+    fiber: { state: 2, uid: 1 },
+    effect: (fn) => offDisposers.push(fn),
+    inject: (deps, cb) => { if (deps.includes("settings")) cb({ settings: offSettings, logger: c.logger }); },
+    tools: { register: (def) => offTools.push(def) },
+    systemPrompt: { section: () => {} },
+  };
+  apply(c, offCfg);
+  await new Promise((r) => setTimeout(r, 350));
+  const offReceived = [];
+  const ws2 = new WebSocket(`ws://127.0.0.1:9809/ws?token=sessions-off`);
+  await new Promise((resolve) => {
+    ws2.onopen = () => {
+      ws2.send(JSON.stringify({ type: "hello", client: "fake-extension", version: "1.7.2", protocol: 1, browser: { name: "fake", version: "1", ua: "" }, capabilities: ["tabs.list", "tabs.open", "click"] }));
+      resolve();
+    };
+    ws2.onmessage = (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.type !== "command") return;
+      offReceived.push({ command: msg.command, params: msg.params ?? {} });
+      if (msg.command === "tabs.list") {
+        ws2.send(JSON.stringify({ type: "result", id: msg.id, ok: true, result: { tabs: [{ id: 500, active: true }], activeTabId: 500, count: 1 } }));
+        return;
+      }
+      ws2.send(JSON.stringify({ type: "result", id: msg.id, ok: true, result: { tabId: msg.params?.tabId ?? 500, clicked: true } }));
+    };
+    setTimeout(resolve, 400);
+  });
+  await new Promise((r) => setTimeout(r, 150));
+  const offClick = offTools.find((t) => t.name === "browser_click");
+  await offClick.execute({ selector: "#loose" }, { signal: signal(), agent: { id: "off-agent" } });
+  const entry = offReceived.at(-1);
+  check("isolateTabs:false ⇒ 省略 tabId 时不注入、不建标签（旧行为：跟随活动页）",
+    entry.command === "click" && entry.params.tabId === undefined && !offReceived.some((e) => e.command === "tabs.open"),
+    JSON.stringify(offReceived));
+  try { ws2.close(); } catch {}
+  offDisposers.reverse().forEach((fn) => { try { fn(); } catch {} });
+}
+
+/* ============ 5. 只读档 ============ */
 {
   const roTools = [];
   const roDisposers = [];

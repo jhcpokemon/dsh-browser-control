@@ -21,8 +21,12 @@ Chrome 浏览器扩展 + DeepSeek Harness 插件，让 AI Agent 通过 CDP 驱�
 - TypeScript（strict 模式）
 - Cordis 插件系统（DeepSeek Harness 生态）
 
-## 信任边界
+## 标签隔离与网页搜索（v1.7.15）
 
+- 省略 `tabId` 的工具调用落到**本会话自己的工作标签页**；会话还没有工作标签页时，插件用 `tabs.open` 自开一个标签（扩展按默认 `group: true` 归进窗口里的 `DSH` 分组）并在那里干活，**不再**把浏览器当前活动标签（通常就是用户手动开的那个）当成自己的。profile 里 `isolateTabs: false` 可恢复旧行为；显式 `tabId` 永远有效
+- `browser_search`（新增，第 31 个工具）纯插件实现：`nav`/`tabs.open` 打开 `https://www.google.com/search?q=…&num=…`，再用扩展的 `eval` 在页面里跑一段抽取脚本（锚点 + `h3` 当标题、最近的 `[data-hveid]` 当摘要块，**不**依赖 Google 的内部 class 名），把标题/URL/摘要按条返回。同意墙与「异常流量」验证会明确报错要人处理，绝不编造结果；`readOnly` 下和别的写命令一样被闸门拒绝
+
+## 信任边界
 - 只绑 `127.0.0.1`；**Token 才是真正的边界，回环绑定不是**
 - `/api/command`、`/api/cleanup` 要求 Token（`Authorization: Bearer` / `X-Token` / `?token=`），与 WS 同一个凭据，常数时间比较
 - WS 升级校验 `Host` 必须是回环（挡 DNS 重绑定）并拒绝网页 `Origin`，只放行 `*-extension://` 与无 Origin 的本机客户端
@@ -43,7 +47,7 @@ Chrome 浏览器扩展 + DeepSeek Harness 插件，让 AI Agent 通过 CDP 驱�
 
 ## 关键文件
 
-- `src/index.ts` - 30 个 `browser_*` 工具注册 + settings 接线的版本兼容分支
+- `src/index.ts` - 31 个 `browser_*` 工具注册 + settings 接线的版本兼容分支
 - `src/policy.ts` - 三张互不相同的表：只读白名单、脚本命令、插件本地破坏性命令（`browser_cleanup` 不经过 `execute()`，必须自己站闸门）
 - `src/server.ts` - WebSocket 服务 + HTTP 面（鉴权、来源校验、状态页）
 - `src/ws.ts` - RFC 6455 帧编解码

@@ -25,7 +25,7 @@
 
 不用起 headless，不用把登录态搬来搬去，也不需要 MCP——它驱动的就是你屏幕上那个已登录的 Chrome。
 
-- 30 个 `browser_*` 工具，agent 说人话就能用
+- 31 个 `browser_*` 工具，agent 说人话就能用
 - 操作可见：agent 开的标签自动进 `DSH` 分组；扩展弹窗一键锁定
 - 本机闸门：只读 / 禁脚本 / 上传白名单
 - 有账可查：操作审计 + 跨重启 journal
@@ -77,11 +77,23 @@ config:
 
 被拦的命令**不会发给浏览器**（零副作用），错误码 `blocked_by_policy`。`browser_upload` 是唯一能把本机文件交给页面的工具：默认关闭，只允许 `uploadDir` 内的文件（符号链接按真实路径判断）。写法与宿主版本差异见 [dsh-config/README.md](dsh-config/README.md)。
 
-## 工具清单（30 个）
+## 标签隔离与网页搜索（v1.7.15）
+
+```yaml
+config:
+  isolateTabs: true       # 默认开：没有工作标签页时自开一个（进 DSH 分组）再干活，不占用你开着的活动标签
+```
+
+省略 `tabId` 的调用只落在**本会话自己的**标签页上；会话还没有工作标签页时，插件用 `tabs.open` 新开一个标签（扩展归进 `DSH` 分组）再在那里工作——以前它会退到浏览器活动标签，也就是你手动开着的那一页。自开失败直接报错，不会悄悄退回你的标签；要看某页就显式传 `tabId`。`isolateTabs: false` 恢复旧行为。
+
+`browser_search` 用**你自己的 Chrome** 跑 Google：打开结果页再把自然结果的标题 / URL / 摘要按条交给模型（继承你的登录态、地区与语言）。遇到「异常流量」验证或同意墙会明确报错并说明该请用户做什么，绝不假装有结果。细节见 [行为契约](docs/BEHAVIOR.md)。
+
+## 工具清单（31 个）
 
 按用途分组；每个工具的入参、回执与边界见 [完整工具清单](docs/TOOLS.md)。
 
 - 页面：`browser_navigate` `browser_read` `browser_snapshot` `browser_find` `browser_click` `browser_type` `browser_press` `browser_scroll` `browser_wait` `browser_evaluate` `browser_drag` `browser_upload`
+- 搜索：`browser_search`
 - 标签与窗口：`browser_tabs` `browser_windows` `browser_sessions`
 - 浏览器状态：`browser_cookies` `browser_dialog` `browser_hold` `browser_emulate` `browser_metrics` `browser_console_log` `browser_network_log` `browser_network_clear`
 - 文件：`browser_screenshot` `browser_pdf` `browser_archive` `browser_cleanup`
@@ -93,7 +105,7 @@ config:
 
 | 文档 | 内容 |
 |---|---|
-| [工具清单](docs/TOOLS.md) | 30 个工具的入参、回执与边界 |
+| [工具清单](docs/TOOLS.md) | 31 个工具的入参、回执与边界 |
 | [行为契约](docs/BEHAVIOR.md) | 导航到达、快照、锁、浮层、拖拽、上传等细节 |
 | [安装排障](docs/INSTALL.md) | 镜像延迟、24 小时包龄、离线包、本地调试 |
 | [安全模型](SECURITY.md) | token、权限与威胁边界 |

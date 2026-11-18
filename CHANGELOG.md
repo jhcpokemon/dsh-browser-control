@@ -1,5 +1,19 @@
 # 更新日志
 
+## v1.7.15-custom.2 (2026-11-18)
+
+> 本版是**本地自定义分支**（`jhcpokemon/dsh-browser-control`，分支 `feature/tab-isolation-browser-search`），
+> 基于上游 **v1.7.14**，未发布到 npm。上游 `1.7.11`–`1.7.14` 的修复（iframe 帧、press 按键、prompt 段落撞名、
+> nav 预算、upload）全部包含在内。**没有动 `extension/`**，按 v1.7.14 的说明用扩展 v1.7.5 即可。
+
+两件事：agent 开的标签不再和你手动开的混在一起；多了一个用真实浏览器跑 Google 的搜索工具。
+
+- **标签隔离（`isolateTabs`，默认开）**：省略 `tabId` 的调用以前在本会话没有工作标签页时会回退到浏览器**活动标签**——那通常就是你自己开着的那一页，于是 agent 在里面导航/打字，看起来就是「混在我的标签里」。现在改为**自开一个标签**（`about:blank`、后台打开、扩展按默认 `group:true` ⇒ 落进窗口的 `DSH` 分组），并记成本会话的工作标签页；自开失败直接报错，**不会**悄悄退回你的标签。`browser_drag` 这类多命令合成的工具走同一条解析（`controller.sessionTab`），不会自己绕回活动页。profile 里 `isolateTabs: false` 恢复旧行为；所有工具的 `tabId` 描述同步改成「本会话工作标签页 / 新开一个归组标签」。
+- **新增第 31 个工具 `browser_search`**：在用户的真实 Chrome 里打开 `google.com/search?q=…&num=…`（有工作标签就用它，没有就 `tabs.open` 直接落在结果页），再用扩展的 `eval` 跑一段页面内抽取脚本，把自然结果的标题/URL/摘要按条返回（去重、解 `google.*/url?q=` 跳转、剔广告域）。抽取只认「锚点套 `h3` + `[data-hveid]` 块」这类稳结构，不认 Google 每周重排的 class 名。同意墙 / 「异常流量」验证 / 一条都读不到，各有**要人做什么**的明确报错，绝不返回空列表假装搜过。`readOnly` 下和其它写命令一样被拦。
+- **`browser_evaluate` 的「100ms 假超时」（修复）**：扩展侧把 `Math.max(100, Number(params.timeoutMs) || 0)` 当页面侧竞速上限，插件以前省略这个字段 ⇒ 页面上任何 `await` 都会死报 `eval timeout after 100ms`，而工具描述写的是「默认 60000」。现在插件**总是**显式发预算（默认 60000、上限 120000），描述与行为对齐。
+- **文档与对账**：`README.md` / `README.en.md`（新增「标签隔离与网页搜索」一节、工具分组加「搜索」、31 个的计数）、`docs/TOOLS.md` / `docs/TOOLS.en.md`（新增 `browser_search` 行）、`docs/BEHAVIOR.md`（新增「标签隔离」「网页搜索」两节 + 修正 v1.7.6 的回退描述 + evaluate 预算一条）、`llms.txt`、`dsh-config/README.md` 全部同步。
+- **验收**：`tsc` 严格模式通过；`verify_surface`（扩展命令表 ↔ 插件调用 ↔ 文档 ↔ 构建产物四层对账，31 个工具）、`verify_sessions`（新增「无工作标签 ⇒ 自开归组标签」与「`isolateTabs:false` 恢复旧行为」两组断言）、`verify_policy`、`verify_render_contract`、`verify_bundle_http`、`verify_audit`、`verify_metrics_throttle`、`verify_snapshot_page` 全绿；`verify_compat_matrix`（新插件 × v1.2.0–1.7.2 旧扩展）通过。真机实测：无工作标签时 `browser_navigate` 新建标签并归组；`browser_search` 在真实 Chrome 里拿到 Google 结果；两个干净上下文的子会话在需要外部事实时**自发**调用了 `browser_search`。
+
 ## v1.7.14 (2026-11-15)
 
 **扩展更新一次：v1.7.5**（需要重装）。修 issue #29：同源 iframe 里的点击/输入/查找/快照。

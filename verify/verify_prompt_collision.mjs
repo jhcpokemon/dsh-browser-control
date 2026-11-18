@@ -34,7 +34,7 @@ function boot({ sectionThrows = false } = {}) {
 {
   const { tools, logs, dispose } = boot({ sectionThrows: true });
   check("prompt section 重名：apply() 不抛错", true);
-  check("prompt section 重名：30 个工具仍然全部注册", tools.length === 30, String(tools.length));
+  check("prompt section 重名：31 个工具仍然全部注册", tools.length === 31, String(tools.length));
   check("prompt section 重名：留下可诊断的 warning",
     logs.some((l) => /prompt section skipped/.test(l) && /already registered/.test(l)), logs.slice(-2).join(" | "));
   dispose();
@@ -43,7 +43,7 @@ function boot({ sectionThrows = false } = {}) {
 /* 2) 正常路径：用我们自己的名字，不占 dsh-builtin-browser 的 tool:browser */
 {
   const { tools, sections, dispose } = boot();
-  check("正常路径：工具仍然 30 个", tools.length === 30, String(tools.length));
+  check("正常路径：工具仍然 31 个", tools.length === 31, String(tools.length));
   check("正常路径：section 名字是 tool:browser-control",
     sections.length === 1 && sections[0]?.name === "tool:browser-control", JSON.stringify(sections.map((s) => s.name)));
   check("正常路径：不再使用会撞车的 tool:browser",

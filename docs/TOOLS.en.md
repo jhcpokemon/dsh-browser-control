@@ -1,8 +1,9 @@
-# Tools (30)
+# Tools (31)
 
 | Tool | Purpose |
 |---|---|
 | `browser_navigate` | Navigate to a URL |
+| `browser_search` | Run a Google search in **your real Chrome**: opens the results page in the session's own tab and returns each organic result's title / URL / snippet (`query` required, `num` 1–20 default 10, optional explicit `tabId`). Inherits your Google login, region and language; a consent wall or Google's "unusual traffic" check fails with what to ask the user for instead of inventing results. Extraction keys off stable structure (an anchor wrapping an `h3`, the nearest `[data-hveid]` block), never Google's weekly-reshuffled class names (v1.7.15+) |
 | `browser_read` | Read page text/HTML — the text itself, in an `offset`/`limit` window |
 | `browser_snapshot` | Page snapshot → the ref list itself (`mode:"ax"` reads Chrome's accessibility tree: role + accessible name); extension 1.7.5+ walks **same-origin iframes** and marks items `(in iframe#shell)`, with `crossOriginFrames` reported honestly |
 | `browser_click` | Click an element (by ref / selector); same-origin frames via `frameSelector` or `"iframe#shell >>> button"` |
