@@ -49,6 +49,7 @@ Agent 和上层脚本可以依赖的确定性语义。违反这些契约视为 b
 
 - 返回值经 CDP `returnByValue` 序列化；不可序列化对象（DOM 节点、函数、代理）返回 `[type: not serializable — …]` 占位串而非空 `{}`。
 - 页面在 Promise 挂起期间跳转 → 结构化错误 `context_destroyed: page navigated while evaluate was pending`，不会耗尽整个超时预算。
+- **页面侧超时预算总是显式发送**（v1.7.15）：扩展把 `Math.max(100, Number(params.timeoutMs) || 0)` 当作页面侧的竞速上限，所以插件省略该字段时预算只有 **100ms** —— 任何 `await` 都报 `eval timeout after 100ms`，而工具描述写的是「默认 60000」。现在 `browser_evaluate` 默认发 60000（上限 120000），描述与行为一致；调用方给 `timeoutMs` 时照旧以它为准。
 
 ## 截图与坐标
 

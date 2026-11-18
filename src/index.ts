@@ -573,6 +573,18 @@ class BridgeController {
 	}
 
 	/**
+	 * The session's recorded working tab, or undefined — this one never opens a
+	 * tab. Tools that can do their whole job while creating the tab (browser_search
+	 * lands directly on the results page) use it to skip the blank-tab-then-navigate
+	 * pair.
+	 */
+	async recordedTab(signal: AbortSignal): Promise<number | undefined> {
+		const sessionId = TOOL_SESSION.getStore()
+		if (sessionId === undefined) return undefined
+		return await this.liveRecordedTab(sessionId, signal)
+	}
+
+	/**
 	 * The tab this session should work in: its recorded working tab while that tab
 	 * is still open, else a new DSH-grouped tab it adopts (v1.7.15 tab isolation).
 	 * `isolateTabs: false` returns undefined instead, leaving the caller with the
@@ -1232,7 +1244,9 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 			const budgetMs = NAV_TIERS.domcontentloaded ?? 4_000
 			// 目标标签页：显式 tabId > 本会话工作标签页 > 自开一个（扩展归进 DSH 分组）。
 			// 什么都不走「浏览器当前活动标签页」——那可能是用户自己正开着的页面。
-			const ownTab = args.tabId === undefined ? await controller.sessionTab(exec.signal) : undefined
+			// 用 recordedTab 而不是 sessionTab：没有工作标签时代码直接 `tabs.open` 落在
+			// 结果页上，省掉「先开空白页再导航」那一发往返。
+			const ownTab = args.tabId === undefined ? await controller.recordedTab(exec.signal) : undefined
 			const nav = args.tabId === undefined && ownTab === undefined
 				? await controller.execute('tabs.open', { url, waitUntil: 'domcontentloaded', timeoutMs: budgetMs }, exec.signal, budgetMs + BRIDGE_MARGIN_MS)
 				: await controller.execute(
@@ -1929,6 +1943,14 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 
 	/** Page-side ceiling of the eval race in the extension; the bridge budget adds slack on top. */
 	const EVAL_MAX_MS = 120_000
+	/**
+	 * What `browser_evaluate` promises when the caller passes no `timeoutMs`. The
+	 * extension computes its own race budget as `Math.max(100, Number(params.timeoutMs) || 0)`,
+	 * so omitting the field silently means a **100 ms** page-side ceiling — every
+	 * non-instant `await` died with `eval timeout after 100ms` while the tool said
+	 * "defaults to 60000". The plugin therefore always sends the budget explicitly.
+	 */
+	const EVAL_DEFAULT_MS = 60_000
 
 	ctx.tools.register(defineTool({
 		name: 'browser_evaluate',
@@ -1954,14 +1976,15 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 			const params: Record<string, unknown> = { expression: args.expression }
 			if (args.tabId !== undefined) params.tabId = args.tabId
 			// The extension races the evaluation at this budget; give the bridge 2s of
-			// slack so the page-side timeout reports first. Omitted → send nothing and
-			// let the bridge default (60s) govern, exactly as before the knob existed.
-			let bridgeCeiling: number | undefined
-			if (typeof args.timeoutMs === 'number' && Number.isFinite(args.timeoutMs)) {
-				const evalBudget = Math.min(EVAL_MAX_MS, Math.max(100, Math.trunc(args.timeoutMs)))
-				params.timeoutMs = evalBudget
-				bridgeCeiling = evalBudget + 2_000
-			}
+			// slack so the page-side timeout reports first. The budget is ALWAYS sent:
+			// leaving it out makes the extension fall back to a 100 ms page-side race
+			// (`Math.max(100, Number(undefined) || 0)`), which is how this tool used to
+			// kill any evaluation that awaited anything.
+			const evalBudget = typeof args.timeoutMs === 'number' && Number.isFinite(args.timeoutMs)
+				? Math.min(EVAL_MAX_MS, Math.max(100, Math.trunc(args.timeoutMs)))
+				: EVAL_DEFAULT_MS
+			params.timeoutMs = evalBudget
+			const bridgeCeiling = evalBudget + 2_000
 			const raw = await controller.execute(
 				'eval',
 				params,
@@ -3141,7 +3164,7 @@ function registerSessionsTool(ctx: Context, controller: BridgeController): void 
 				const v = value as unknown as { current?: string; sessions: { sessionId: string; workingTabId?: number; lastActiveAt: number; calls: number }[]; releasedTabId?: number }
 				const short = (id: string) => (id.length <= 18 ? id : `${sliceWellFormed(id, 16)}…`)
 				if (v.releasedTabId !== undefined) {
-					return [{ type: 'text', text: `Sessions: released your working tab ${v.releasedTabId} — later calls without tabId follow the browser's active tab again.` }]
+					return [{ type: 'text', text: `Sessions: released your working tab ${v.releasedTabId} — later calls without tabId open a new DSH-grouped tab (or follow the browser's active tab when isolateTabs is off).` }]
 				}
 				if (v.sessions.length === 0) {
 					return [{ type: 'text', text: 'Sessions: 0 — no agent-scoped tool calls yet (calls without an agent identity keep the old active-tab behaviour).' }]
