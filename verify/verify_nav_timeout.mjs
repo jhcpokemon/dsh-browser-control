@@ -106,7 +106,10 @@ check("evaluate 参数表暴露了 timeoutMs", evalProps.timeoutMs !== undefined
 
 reply = true;
 await evalTool.execute({ expression: "1+1" }, { signal: signal() });
-check("evaluate 默认不带 timeoutMs（桥 60s 兜底，与旋钮出现前一致）", lastEvalParams?.timeoutMs === undefined, JSON.stringify(lastEvalParams));
+// v1.7.15：扩展把 Math.max(100, Number(params.timeoutMs) || 0) 当页面侧竞速上限，
+// 省略字段等于 100ms —— 所以插件现在总是显式发预算（默认 60000），否则任何 await 都会死。
+check("evaluate 默认显式发 timeoutMs=60000（不再让扩展落到 100ms 的假超时）", lastEvalParams?.timeoutMs === 60_000, JSON.stringify(lastEvalParams));
+check("evaluate 默认保住工具描述承诺的 60s 预算", lastEvalParams?.timeoutMs !== undefined && lastEvalParams.timeoutMs >= 60_000, JSON.stringify(lastEvalParams));
 await evalTool.execute({ expression: "2+2", timeoutMs: 5_000 }, { signal: signal() });
 check("evaluate 显式 timeoutMs=5000 原样传下去", lastEvalParams?.timeoutMs === 5_000, JSON.stringify(lastEvalParams));
 await evalTool.execute({ expression: "3+3", timeoutMs: 999_999 }, { signal: signal() });
